@@ -1,173 +1,199 @@
 import { MetaDetail } from 'stremio-addon-sdk';
-import { fetchBingRatings, fetchGoogleRatings, fetchYahooRatings, getMetadata } from './api';
+import { fetchRatingsFromOMDb, getMetadata } from './api';
 import { RedisClientType } from 'redis';
 import { addRatingToImage } from './image';
 import axios from 'axios';
 import { getRatingsfromTTIDs } from '../repository';
 import { getContext } from '../context';
+import dotenv from 'dotenv';
 
-export async function getRatingsFromGoogle(query: string, imdbId: string, cacheClient: RedisClientType | null): Promise<Record<string, string>> {
-    try {
-        const ratings = await fetchGoogleRatings(query); // Replace with your logic to fetch ratings from Google
+// Load environment variables
+dotenv.config();
 
-        if (!cacheClient.isOpen) {
-            await cacheClient.connect();
-        }
-        // Cache the ratings if available
-        for (const [key, value] of Object.entries(ratings)) {
-            const cacheKey = `${imdbId}_${key}_v1.0`;
-            console.log('Caching:', cacheKey, value);
-            await cacheClient?.set(cacheKey, value);
-            await cacheClient?.expire(cacheKey, 86400); // Cache for 1 day
-        }
+// Simple in-memory cache as fallback when Redis is not available
+const memoryCache = new Map<string, { value: string, timestamp: number }>();
+const CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
 
-        return ratings;
-    } catch (error) {
-        console.error(`Error fetching Google ratings: ${(error as Error).message}`);
-        throw error;
-    }
-}
-
-export async function getRatingsFromBing(query: string, imdbId: string, cacheClient: RedisClientType | null): Promise<Record<string, string>> {
-    try {
-        const ratings = await fetchBingRatings(query); // Replace with your logic to fetch ratings from Bing
-
-        if (!cacheClient.isOpen) {
-            await cacheClient.connect();
-        }
-        // Cache the ratings if available
-        for (const [key, value] of Object.entries(ratings)) {
-            const cacheKey = `${imdbId}_${key}_v1.0`;
-            console.log('Caching:', cacheKey, value);
-            await cacheClient?.set(cacheKey, value);
-            await cacheClient?.expire(cacheKey, 86400); // Cache for 1 day
-        }
-
-        return ratings;
-    } catch (error) {
-        console.error(`Error fetching Bing ratings: ${(error as Error).message}`);
-        throw error;
-    }
-}
-
-export async function getRatingsFromYahoo(query: string, imdbId: string, cacheClient: RedisClientType | null): Promise<Record<string, string>> {
-    try {
-        const ratings = await fetchYahooRatings(query); // Replace with your logic to fetch ratings from Yahoo
-
-        if (!cacheClient.isOpen) {
-            await cacheClient.connect();
-        }
-        // Cache the ratings if available
-        for (const [key, value] of Object.entries(ratings)) {
-            const cacheKey = `${imdbId}_${key}_v1.0`;
-            console.log('Caching:', cacheKey, value);
-            await cacheClient?.set(cacheKey, value);
-            await cacheClient?.expire(cacheKey, 86400); // Cache for 1 day
-        }
-
-        return ratings;
-    } catch (error) {
-        console.error(`Error fetching Yahoo ratings: ${(error as Error).message}`);
-        throw error;
-    }
-}
-
-export async function scrapeRatings(imdbId: string, type: string, providers: string[]): Promise<MetaDetail> {
-
-    const cacheClient = getContext().cacheClient;
-    const metadata = await getMetadata(imdbId, type);
-    let ratingMap: Record<string, string> = {};
-    try {
-        const query = `${metadata.name} - ${type}`;
-
-        // Check if ratings are already cached
-        ratingMap = await getRatingsFromCache(imdbId, cacheClient);
-        if (Object.keys(ratingMap).length == 0) {
-            console.log('Ratings not found in cache, fetching from sources...');
-            const ratingPromises = [
-                getRatingsFromGoogle(query, imdbId, cacheClient).then(ratings => ({ ...ratings })),
-                getRatingsFromBing(query, imdbId, cacheClient).then(ratings => ({ ...ratings })),
-                getRatingsFromYahoo(query, imdbId, cacheClient).then(ratings => ({ ...ratings })),
-            ];
-            const firstSuccess = await Promise.any(ratingPromises);
-            ratingMap = firstSuccess;
-        }
-        // Define an array of promises for rating sources
-
-        console.log('Ratings:', ratingMap);
-
-        // Update description with ratings
-        metadata.description = metadata.description || '';
-        const filteredRatings: Record<string, string> = {};
-        for (const [key, value] of Object.entries(ratingMap)) {
-            if (providers.includes('all') || providers.includes(key)) {
-                metadata.description += `(${key.replace('_', ' ')}: ${value}) `;
-                filteredRatings[key] = value;
-            }
-        }
-
-        // Modify the poster if available
-        if (metadata.poster && Object.keys(ratingMap).length > 0) {
-            const response = await axios.get(metadata.poster, { responseType: 'arraybuffer' });
-            const posterBase64 = Buffer.from(response.data).toString('base64');
-            const modifiedPoster = await addRatingToImage(posterBase64, filteredRatings);
-            metadata.poster = modifiedPoster;
-        }
-
-        return metadata;
-
-    } catch (error) {
-        console.error(`Error fetching ratings: ${(error as Error).message}`);
-        return metadata;
-    }
-}
-
+// Helper function to get ratings from cache (Redis or in-memory)
 async function getRatingsFromCache(imdbId: string, cacheClient: RedisClientType | null): Promise<Record<string, string>> {
-    const ratingMap: Record<string, string> = {};
-    const ratingKeys = ['imdb', 'metacritic', 'rotten_tomatoes'];
-
-    if (cacheClient) {
+  const ratingMap: Record<string, string> = {};
+  const ratingKeys = ['imdb', 'metacritic', 'rotten_tomatoes'];
+  
+  // First try Redis if available
+  if (cacheClient) {
+    try {
+      if (!cacheClient.isOpen) {
+        await cacheClient.connect().catch(() => {
+          console.log('Failed to connect to Redis, using in-memory cache instead');
+          return null;
+        });
+      }
+      
+      if (cacheClient.isOpen) {
         for (const key of ratingKeys) {
-            const cacheKey = `${imdbId}:${key}`;
-            const rating = await cacheClient.get(cacheKey);
-            if (rating) {
-                ratingMap[key] = rating;
-            }
-        }
-    }
-
-    return ratingMap;
-}
-
-
-export async function getRatingsfromDB(metas: MetaDetail[], providers: string[]): Promise<MetaDetail[]> {
-    const ttids = metas.map(meta => meta.id);
-    const ratings = await getRatingsfromTTIDs(ttids);
-
-    const modifiedMetaPromises = await metas.map(async meta => {
-        if (!ratings[meta.id]) {
-            return meta;
-        }
-
-        // update description with ratings
-        meta.description = meta.description || '';
-        let filteredRatings = {};
-
-        for (const [key, value] of Object.entries(ratings[meta.id])) {
-            if (providers.includes('all') || providers.includes(key)) {
-                meta.description += `(${key.replace('_', ' ')}: ${value}) `;
-                filteredRatings[key] = value;
-            }
+          const cacheKey = `${imdbId}_${key}_v1.0`;
+          const rating = await cacheClient.get(cacheKey);
+          if (rating) {
+            ratingMap[key] = rating;
+          }
         }
         
-        if (meta.poster && Object.keys(ratings[meta.id]).length > 0) {
-            const response = await axios.get(meta.poster, { responseType: 'arraybuffer' });
-            const posterBase64 = Buffer.from(response.data).toString('base64');
-            const modifiedPoster = await addRatingToImage(posterBase64, filteredRatings);
-            meta.poster = modifiedPoster;
+        if (Object.keys(ratingMap).length > 0) {
+          console.log(`Retrieved ratings from Redis cache for ${imdbId}`);
+          return ratingMap;
         }
-        return meta;
-    });
-
-    return await Promise.all(modifiedMetaPromises);
+      }
+    } catch (error) {
+      console.error(`Error accessing Redis cache: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  
+  // Try in-memory cache as fallback
+  for (const key of ratingKeys) {
+    const cacheKey = `${imdbId}_${key}_v1.0`;
+    const cachedItem = memoryCache.get(cacheKey);
+    
+    if (cachedItem && (Date.now() - cachedItem.timestamp) < CACHE_TTL) {
+      ratingMap[key] = cachedItem.value;
+    }
+  }
+  
+  if (Object.keys(ratingMap).length > 0) {
+    console.log(`Retrieved ratings from in-memory cache for ${imdbId}`);
+  }
+  
+  return ratingMap;
 }
+
+// Helper function to save ratings to cache (Redis or in-memory)
+async function saveRatingsToCache(imdbId: string, ratings: Record<string, string>, cacheClient: RedisClientType | null): Promise<void> {
+  // Try Redis first if available
+  if (cacheClient) {
+    try {
+      if (!cacheClient.isOpen) {
+        await cacheClient.connect().catch(() => {
+          console.log('Failed to connect to Redis, using in-memory cache instead');
+          return null;
+        });
+      }
+      
+      if (cacheClient.isOpen) {
+        for (const [key, value] of Object.entries(ratings)) {
+          const cacheKey = `${imdbId}_${key}_v1.0`;
+          console.log('Caching in Redis:', cacheKey, value);
+          await cacheClient.set(cacheKey, value);
+          await cacheClient.expire(cacheKey, 86400); // Cache for 1 day
+        }
+        
+        console.log(`Saved ratings to Redis cache for ${imdbId}`);
+        return;
+      }
+    } catch (error) {
+      console.error(`Error saving to Redis cache: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  
+  // Use in-memory cache as fallback
+  for (const [key, value] of Object.entries(ratings)) {
+    const cacheKey = `${imdbId}_${key}_v1.0`;
+    console.log('Caching in memory:', cacheKey, value);
+    memoryCache.set(cacheKey, {
+      value,
+      timestamp: Date.now()
+    });
+  }
+  
+  console.log(`Saved ratings to in-memory cache for ${imdbId}`);
+}
+
+// Main function to fetch or retrieve ratings from cache
+export async function scrapeRatings(imdbId: string, type: string, providers: string[]): Promise<MetaDetail> {
+  const cacheClient = getContext().cacheClient;
+  const metadata = await getMetadata(imdbId, type);
+  
+  try {
+    // Check if ratings are already cached
+    let ratingMap: Record<string, string> = await getRatingsFromCache(imdbId, cacheClient);
+    
+    if (Object.keys(ratingMap).length === 0) {
+      console.log('Ratings not found in cache, fetching from OMDB...');
+      
+      // Fetch from OMDB API
+      ratingMap = await fetchRatingsFromOMDb(metadata.name, metadata.year?.toString());
+      
+      // Save to cache if we got any ratings
+      if (Object.keys(ratingMap).length > 0) {
+        await saveRatingsToCache(imdbId, ratingMap, cacheClient);
+      }
+    }
+    
+    console.log('Ratings:', ratingMap);
+    
+    // Update description with ratings
+    metadata.description = metadata.description || '';
+    const filteredRatings: Record<string, string> = {};
+    
+    for (const [key, value] of Object.entries(ratingMap)) {
+      if (providers.includes('all') || providers.includes(key)) {
+        metadata.description += `(${key.replace('_', ' ')}: ${value}) `;
+        filteredRatings[key] = value;
+      }
+    }
+    
+    // Modify the poster if available
+    if (metadata.poster && Object.keys(filteredRatings).length > 0) {
+      const response = await axios.get(metadata.poster, { responseType: 'arraybuffer' });
+      const posterBase64 = Buffer.from(response.data).toString('base64');
+      const modifiedPoster = await addRatingToImage(posterBase64, filteredRatings);
+      metadata.poster = modifiedPoster;
+    }
+    
+    return metadata;
+  } catch (error) {
+    console.error(`Error fetching ratings: ${error instanceof Error ? error.message : String(error)}`);
+    return metadata;
+  }
+}
+
+// Support for bulk rating retrieval
+export async function getRatingsfromDB(metas: MetaDetail[], providers: string[]): Promise<MetaDetail[]> {
+  const ttids = metas.map(meta => meta.id);
+  const ratings = await getRatingsfromTTIDs(ttids);
+  
+  const modifiedMetaPromises = await metas.map(async meta => {
+    if (!ratings[meta.id]) {
+      return meta;
+    }
+    
+    // update description with ratings
+    meta.description = meta.description || '';
+    let filteredRatings: Record<string, string> = {};
+    for (const [key, value] of Object.entries(ratings[meta.id])) {
+      if (providers.includes('all') || providers.includes(key)) {
+        meta.description += `(${key.replace('_', ' ')}: ${value}) `;
+        filteredRatings[key] = value;
+      }
+    }
+    
+    if (meta.poster && Object.keys(ratings[meta.id]).length > 0) {
+      const response = await axios.get(meta.poster, { responseType: 'arraybuffer' });
+      const posterBase64 = Buffer.from(response.data).toString('base64');
+      const modifiedPoster = await addRatingToImage(posterBase64, filteredRatings);
+      meta.poster = modifiedPoster;
+    }
+    
+    return meta;
+  });
+  
+  return await Promise.all(modifiedMetaPromises);
+}
+
+// Legacy functions kept for compatibility - these replace the web scraping functions
+export const getRatingsFromGoogle = async () => ({});
+export const getRatingsFromBing = async () => ({});
+export const getRatingsFromYahoo = async () => ({});
+export const fetchGoogleRatings = async () => ({});
+export const fetchBingRatings = async () => ({});
+export const fetchYahooRatings = async () => ({});
+
+export default scrapeRatings;
