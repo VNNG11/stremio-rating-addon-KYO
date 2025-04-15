@@ -119,7 +119,8 @@ export async function scrapeRatings(imdbId: string, type: string, providers: str
       console.log('Ratings not found in cache, fetching from OMDB...');
       
       // Fetch from OMDB API
-      ratingMap = await fetchRatingsFromOMDb(metadata.name, metadata.year?.toString());
+      const year = (metadata as any).year ? String((metadata as any).year) : '';
+ratingMap = await fetchRatingsFromOMDb(metadata.name, year);
       
       // Save to cache if we got any ratings
       if (Object.keys(ratingMap).length > 0) {
